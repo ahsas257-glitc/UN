@@ -1,0 +1,18 @@
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "dark"
+primaryColor = "#0A84FF"
+backgroundColor = "#000000"
+secondaryBackgroundColor = "#0A0A0C"
+textColor = "#FFFFFF"
+
+[client]
+toolbarMode = "minimal"
+
+[ui]
+hideTopBar = true
