@@ -71,6 +71,7 @@ streamlit run app.py
 ## Streamlit Cloud
 - Entry point: `app.py`
 - Theme is controlled by admin config/secrets and user theme toggle is hidden.
+- `packages.txt` includes `chromium` for Plotly/Kaleido static chart export in reports.
 - Optional forms directory for adaptive dashboards:
   - `XLS_FORMS_DIR = "C:/Users/LENOVO/Documents/XLS_Forms"`
 - Optional locked theme override:

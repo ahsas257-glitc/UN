@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import io
+import logging
 import re
 import zipfile
 from datetime import datetime
@@ -52,6 +54,13 @@ WEEKDAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturd
 MAX_WORD_CHART_SECTIONS = 40
 DOCX_IMAGE_WIDTH_INCH = 6.4
 DOCX_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
+PLOT_IMAGE_FALLBACK_PNG_BYTES = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+X8ksAAAAASUVORK5CYII="
+)
+
+_logger = logging.getLogger(__name__)
+_kaleido_chrome_install_attempted = False
+_plotly_image_export_warning_logged = False
 
 
 def _safe_series(df: pd.DataFrame, column: str | None) -> pd.Series:
@@ -248,8 +257,33 @@ def _relevant_progress(scope_kind: str, data: pd.DataFrame, progress: pd.DataFra
 
 
 def _figure_to_png_bytes(fig) -> bytes:
+    global _kaleido_chrome_install_attempted, _plotly_image_export_warning_logged
+
     fig.update_layout(width=PLOT_IMAGE_WIDTH, height=PLOT_IMAGE_HEIGHT)
-    return fig.to_image(format="png", width=PLOT_IMAGE_WIDTH, height=PLOT_IMAGE_HEIGHT, scale=1)
+    try:
+        return fig.to_image(format="png", width=PLOT_IMAGE_WIDTH, height=PLOT_IMAGE_HEIGHT, scale=1)
+    except Exception as exc:
+        error_text = str(exc).lower()
+        # Kaleido v1+ needs a browser; try one auto-install attempt on cloud runners.
+        if "kaleido" in error_text and "chrome" in error_text and not _kaleido_chrome_install_attempted:
+            _kaleido_chrome_install_attempted = True
+            try:
+                import kaleido
+
+                install_chrome = getattr(kaleido, "get_chrome_sync", None)
+                if callable(install_chrome):
+                    install_chrome()
+                    return fig.to_image(format="png", width=PLOT_IMAGE_WIDTH, height=PLOT_IMAGE_HEIGHT, scale=1)
+            except Exception:
+                pass
+
+        if not _plotly_image_export_warning_logged:
+            _plotly_image_export_warning_logged = True
+            _logger.warning(
+                "Plotly image export failed. Falling back to placeholder PNG for report charts. Error: %s",
+                exc,
+            )
+        return PLOT_IMAGE_FALLBACK_PNG_BYTES
 
 
 def _org_activity_chart(activity_df: pd.DataFrame, org_label: str, theme_mode: ThemeMode):
