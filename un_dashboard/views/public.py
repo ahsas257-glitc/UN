@@ -7,23 +7,26 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from un_dashboard.core.constants import (
-    EXPECTED_TOTAL_ORGS,
-    ORG_SHEET_TABS,
-    POSITIVE_VALUES,
-    TARGET_INTERVIEWS_PER_ORG,
-    YES_VALUES,
+from un_dashboard.core.constants import EXPECTED_TOTAL_ORGS, ORG_SHEET_TABS, TARGET_INTERVIEWS_PER_ORG
+from un_dashboard.design import (
+    ThemeMode,
+    chart_palette_for,
+    chart_scale_for,
+    clickable_tabs,
+    render_glass_list,
+    render_glass_stats,
+    render_report_hero,
+    section_heading,
+    style_plotly_figure,
 )
-from un_dashboard.design import ThemeMode, chart_palette_for, chart_scale_for, section_heading, style_plotly_figure
-from un_dashboard.services.exporter import to_excel_bytes
+from un_dashboard.services.reporting import build_report_artifacts
 from un_dashboard.services.transforms import (
     build_daily_interviews,
     build_partner_province_matrix,
     format_percent,
-    sanitize_for_display,
-    score_positive_rate,
     top_orgs_by_progress,
 )
+
 
 def render_public_dashboard(
     filtered: pd.DataFrame,
@@ -35,14 +38,13 @@ def render_public_dashboard(
     total_interviews = int(len(filtered))
     if "sheet_name" in filtered.columns:
         active_projects = int(filtered["sheet_name"].dropna().astype(str).nunique()) if not filtered.empty else 0
-    else:
-        active_projects = int(filtered["org_code"].nunique()) if not filtered.empty else 0
-    if "sheet_name" in filtered.columns:
         loaded_projects = {str(x).strip() for x in filtered["sheet_name"].dropna().astype(str).tolist() if str(x).strip()}
         designed_count = int(len([x for x in ORG_SHEET_TABS if x in loaded_projects]))
     else:
+        active_projects = int(filtered["org_code"].nunique()) if not filtered.empty else 0
         designed_count = int(progress["is_designed"].sum()) if not progress.empty else 0
-    target_total = EXPECTED_TOTAL_ORGS * TARGET_INTERVIEWS_PER_ORG
+
+    target_total = int(pd.to_numeric(progress["target"], errors="coerce").fillna(0).sum()) if not progress.empty else EXPECTED_TOTAL_ORGS * TARGET_INTERVIEWS_PER_ORG
     completion = total_interviews / target_total if target_total else np.nan
 
     with st.container():
@@ -86,39 +88,90 @@ def render_public_report(
     filtered: pd.DataFrame,
     progress: pd.DataFrame,
     indicators: dict[str, str | None],
+    theme_mode: ThemeMode,
 ) -> None:
-    helpful_rate = (
-        score_positive_rate(filtered[indicators["helpful"]], POSITIVE_VALUES)
-        if indicators["helpful"] and indicators["helpful"] in filtered.columns
-        else float("nan")
-    )
-    training_rate = (
-        score_positive_rate(filtered[indicators["training"]], YES_VALUES)
-        if indicators["training"] and indicators["training"] in filtered.columns
-        else float("nan")
-    )
-    complaint_rate = (
-        score_positive_rate(filtered[indicators["complaint_awareness"]], YES_VALUES)
-        if indicators["complaint_awareness"] and indicators["complaint_awareness"] in filtered.columns
-        else float("nan")
-    )
-
     with st.container():
-        section_heading("Public Report Summary", "Calculated indicators for filtered dataset.")
-        st.write(f"- Interviews analyzed: **{len(filtered)}** / **{EXPECTED_TOTAL_ORGS * TARGET_INTERVIEWS_PER_ORG}**")
-        st.write(f"- Training attendance (Yes): **{format_percent(training_rate)}**")
-        st.write(f"- Helpfulness (Yes/Partly): **{format_percent(helpful_rate)}**")
-        st.write(f"- Complaint awareness (Yes): **{format_percent(complaint_rate)}**")
+        if filtered.empty:
+            st.info("No records are available for the current filters.")
+            return
 
-        st.download_button(
-            "Download Public Report (Excel)",
-            data=to_excel_bytes(
-                {
-                    "public_report": progress,
-                    "filtered_data": sanitize_for_display(filtered).head(2000),
-                }
-            ),
-            file_name="un_women_public_report.xlsx",
+        artifacts = build_report_artifacts(
+            scope_kind="public",
+            scope_label="Filtered public scope",
+            data=filtered,
+            progress=progress,
+            indicators=indicators,
+            theme_mode=theme_mode,
+        )
+
+        metric_map = {row["Metric"]: row["Value"] for _, row in artifacts["summary_table"].iterrows()}
+        render_report_hero(
+            title="Public Report Intelligence Center",
+            subtitle="Advanced public reporting with narrative analysis, portfolio-wide visuals, and per-organization start-date activity intelligence.",
+            badges=["PDF", "Word", "Excel", "Start-Date Analytics"],
+        )
+        render_glass_stats(
+            [
+                {"label": "Interviews", "value": metric_map.get("Interviews analyzed", "0"), "note": "Filtered public dataset"},
+                {"label": "Completion", "value": metric_map.get("Completion", "N/A"), "note": "Against active target baseline"},
+                {"label": "Organizations", "value": metric_map.get("Organizations covered", "0"), "note": "Distinct organizations in scope"},
+                {"label": "Partners", "value": metric_map.get("Partners covered", "0"), "note": "Distinct INGO partners represented"},
+            ]
+        )
+
+        info_col, risk_col, rec_col = st.columns(3)
+        with info_col:
+            render_glass_list("Executive Summary", artifacts["insights"])
+        with risk_col:
+            render_glass_list("Key Risks", artifacts["risks"])
+        with rec_col:
+            render_glass_list("Recommendations", artifacts["recommendations"])
+
+        st.dataframe(artifacts["indicator_table"], use_container_width=True, hide_index=True)
+
+        section_heading("Core Analytical Visuals", "Portfolio-wide charts included in the downloadable report package.")
+        for chart in artifacts["charts"]:
+            st.markdown(f"##### {chart['title']}")
+            st.caption(chart["caption"])
+            st.image(chart["image"], use_container_width=True)
+            st.dataframe(chart["table"].head(20), use_container_width=True, hide_index=True)
+
+        org_sections = artifacts.get("org_activity_sections", [])
+        if org_sections:
+            section_heading(
+                "Organization Start-Date Activity",
+                "Modern daily interview chart for each organization based on the `start` column.",
+            )
+            org_options = [section["org_code"] for section in org_sections]
+            selected_org = clickable_tabs(
+                org_options,
+                key="public_report_org_activity",
+                label="Preview organization timeline",
+            )
+            selected_section = next((section for section in org_sections if section["org_code"] == selected_org), org_sections[0])
+            st.markdown(f"##### {selected_section['title']}")
+            st.caption(selected_section["caption"])
+            st.image(selected_section["image"], use_container_width=True)
+            st.dataframe(selected_section["table"].head(31), use_container_width=True, hide_index=True)
+
+        section_heading("Download Package", "Export the complete advanced report in the required format.")
+        download_cols = st.columns(3)
+        download_cols[0].download_button(
+            "Download PDF Report",
+            data=artifacts["pdf_bytes"],
+            file_name=f"{artifacts['file_stub']}.pdf",
+            mime="application/pdf",
+        )
+        download_cols[1].download_button(
+            "Download Word Report",
+            data=artifacts["word_bytes"],
+            file_name=f"{artifacts['file_stub']}.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+        download_cols[2].download_button(
+            "Download Excel Report",
+            data=artifacts["excel_bytes"],
+            file_name=f"{artifacts['file_stub']}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 

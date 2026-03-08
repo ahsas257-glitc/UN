@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+import streamlit as st
 
 from un_dashboard.core.constants import (
     ARABIC_SCRIPT_RE,
@@ -62,6 +63,22 @@ def _column_as_series(df: pd.DataFrame, column: str) -> Optional[pd.Series]:
     return selected
 
 
+def ensure_unique_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+
+    out = df.copy()
+    seen: dict[str, int] = {}
+    columns: list[str] = []
+    for raw in out.columns:
+        base = str(raw).strip() or "unnamed"
+        count = seen.get(base, 0)
+        columns.append(base if count == 0 else f"{base}.{count}")
+        seen[base] = count + 1
+    out.columns = columns
+    return out
+
+
 def contains_non_english_text(value: Any) -> bool:
     if pd.isna(value):
         return False
@@ -104,6 +121,7 @@ def format_percent(value: float) -> str:
     return "—" if pd.isna(value) else f"{value * 100:.1f}%"
 
 
+@st.cache_data(show_spinner=False, ttl=600)
 def prepare_data_bundle(workbook: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
     frames: List[pd.DataFrame] = []
     correction_log = pd.DataFrame(columns=["_uuid", "Label", "old_value", "new_value"])
@@ -119,7 +137,7 @@ def prepare_data_bundle(workbook: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame
         if org_code:
             designed_orgs.append(org_code)
 
-        df = source_df.copy()
+        df = ensure_unique_columns(source_df.copy())
         if "_uuid" not in df.columns:
             alt_uuid = find_column(df, ["_uuid", "uuid", "instanceid", "_id"])
             alt_uuid_series = _column_as_series(df, alt_uuid) if alt_uuid else None
@@ -134,6 +152,7 @@ def prepare_data_bundle(workbook: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame
     return combined, correction_log, sorted(set([x for x in designed_orgs if x]))
 
 
+@st.cache_data(show_spinner=False, ttl=600)
 def clean_correction_log(df: pd.DataFrame) -> pd.DataFrame:
     required = ["_uuid", "Label", "old_value", "new_value"]
     if df is None or df.empty:
@@ -152,6 +171,7 @@ def clean_correction_log(df: pd.DataFrame) -> pd.DataFrame:
     return out.drop_duplicates(subset=["_uuid", "Label", "old_value"], keep="last")
 
 
+@st.cache_data(show_spinner=False, ttl=600)
 def apply_corrections(data: pd.DataFrame, correction_log: pd.DataFrame) -> pd.DataFrame:
     if data.empty or correction_log.empty or "_uuid" not in data.columns:
         return data.copy()
@@ -185,6 +205,7 @@ def apply_corrections(data: pd.DataFrame, correction_log: pd.DataFrame) -> pd.Da
     return corrected
 
 
+@st.cache_data(show_spinner=False, ttl=600)
 def build_master_table(data_org_codes: Sequence[str], designed_orgs: Sequence[str]) -> pd.DataFrame:
     master = org_master_frame()
     known = set(master["org_code"].tolist())
@@ -199,6 +220,7 @@ def build_master_table(data_org_codes: Sequence[str], designed_orgs: Sequence[st
     return master
 
 
+@st.cache_data(show_spinner=False, ttl=600)
 def build_progress_table(master: pd.DataFrame, data: pd.DataFrame) -> pd.DataFrame:
     counts = data.groupby("org_code", dropna=False).size().rename("interviews").reset_index()
     out = master.merge(counts, on="org_code", how="left")
@@ -299,6 +321,7 @@ def apply_filters(
     return filtered
 
 
+@st.cache_data(show_spinner=False, ttl=600)
 def build_daily_interviews(data: pd.DataFrame, date_column: Optional[str]) -> pd.DataFrame:
     if data.empty or not date_column or date_column not in data.columns:
         return pd.DataFrame(columns=["date", "interviews", "cumulative"])
@@ -330,6 +353,55 @@ def build_daily_interviews(data: pd.DataFrame, date_column: Optional[str]) -> pd
     return daily
 
 
+@st.cache_data(show_spinner=False, ttl=600)
+def build_org_daily_activity(
+    data: pd.DataFrame,
+    date_column: Optional[str],
+    org_column: str = "org_code",
+) -> pd.DataFrame:
+    columns = ["org_code", "date", "weekday_num", "weekday_name", "interviews", "cumulative"]
+    if data.empty or not date_column or date_column not in data.columns:
+        return pd.DataFrame(columns=columns)
+
+    date_series = _column_as_series(data, date_column)
+    if date_series is None:
+        return pd.DataFrame(columns=columns)
+
+    parsed_dates = pd.to_datetime(date_series, errors="coerce", utc=True)
+    if isinstance(parsed_dates, pd.DatetimeIndex):
+        parsed_series = pd.Series(parsed_dates, index=data.index)
+    elif isinstance(parsed_dates, pd.Series):
+        parsed_series = parsed_dates
+    else:
+        parsed_series = pd.to_datetime(pd.Series(parsed_dates, index=data.index), errors="coerce", utc=True)
+
+    temp = pd.DataFrame(index=data.index)
+    temp["parsed_date"] = parsed_series.dt.tz_convert(None)
+    temp = temp.dropna(subset=["parsed_date"])
+    if temp.empty:
+        return pd.DataFrame(columns=columns)
+
+    if org_column in data.columns:
+        temp["org_code"] = _column_as_series(data, org_column).astype(str)
+    else:
+        temp["org_code"] = "Current Scope"
+
+    temp["date"] = temp["parsed_date"].dt.date
+    temp["weekday_num"] = temp["parsed_date"].dt.dayofweek
+    temp["weekday_name"] = temp["parsed_date"].dt.day_name()
+
+    grouped = (
+        temp.groupby(["org_code", "date", "weekday_num", "weekday_name"], dropna=False)
+        .size()
+        .rename("interviews")
+        .reset_index()
+        .sort_values(["org_code", "date"])
+    )
+    grouped["cumulative"] = grouped.groupby("org_code")["interviews"].cumsum()
+    return grouped.reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False, ttl=600)
 def build_partner_province_matrix(data: pd.DataFrame) -> pd.DataFrame:
     if data.empty or "ingo_partner" not in data.columns or "province" not in data.columns:
         return pd.DataFrame()
@@ -341,6 +413,7 @@ def build_partner_province_matrix(data: pd.DataFrame) -> pd.DataFrame:
     return matrix.reset_index()
 
 
+@st.cache_data(show_spinner=False, ttl=600)
 def top_orgs_by_progress(progress: pd.DataFrame, limit: int = 5) -> pd.DataFrame:
     if progress.empty:
         return progress

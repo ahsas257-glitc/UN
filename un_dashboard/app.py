@@ -7,6 +7,7 @@ import streamlit as st
 
 from un_dashboard.core.constants import DEFAULT_INDICATOR_CANDIDATES, DEFAULT_SHEET_URL, DEFAULT_XLS_FORMS_DIR
 from un_dashboard.design import (
+    clickable_tabs,
     configure_page,
     inject_liquid_glass_theme,
     plotly_template_for,
@@ -20,6 +21,7 @@ from un_dashboard.services.transforms import (
     build_master_table,
     build_progress_table,
     clean_correction_log,
+    ensure_unique_columns,
     get_indicator_columns,
     prepare_data_bundle,
 )
@@ -90,6 +92,7 @@ def main() -> None:
                 data[col] = pd.Series(dtype="object")
     else:
         data = corrected_data.merge(master[["org_code", "province", "ingo_partner"]], on="org_code", how="left")
+        data = ensure_unique_columns(data)
     indicators = get_indicator_columns(data, DEFAULT_INDICATOR_CANDIDATES)
 
     with st.sidebar:
@@ -119,20 +122,30 @@ def main() -> None:
         consent_column=indicators.get("consent"),
     )
 
-    filtered_progress = build_progress_table(master, filtered)
+    filtered_master = master.copy()
+    if selected_orgs:
+        filtered_master = filtered_master[filtered_master["org_code"].isin(selected_orgs)]
+    if selected_partners:
+        filtered_master = filtered_master[filtered_master["ingo_partner"].isin(selected_partners)]
+    if selected_provinces:
+        filtered_master = filtered_master[filtered_master["province"].isin(selected_provinces)]
+
+    filtered_progress = build_progress_table(filtered_master, filtered)
     all_org_progress = build_progress_table(master, data)
 
-    tab_public_dashboard, tab_public_report, tab_advanced, tab_org = st.tabs(
-        ["Public Dashboard", "Public Report", "Advanced Insights", "Organizations"]
+    main_section = clickable_tabs(
+        ["Public Dashboard", "Public Report", "Advanced Insights", "Organizations"],
+        key="main_module_tabs",
+        label="Module",
     )
 
-    with tab_public_dashboard:
+    if main_section == "Public Dashboard":
         render_public_dashboard(filtered=filtered, progress=filtered_progress, template=template, theme_mode=theme_mode)
 
-    with tab_public_report:
-        render_public_report(filtered=filtered, progress=filtered_progress, indicators=indicators)
+    elif main_section == "Public Report":
+        render_public_report(filtered=filtered, progress=filtered_progress, indicators=indicators, theme_mode=theme_mode)
 
-    with tab_advanced:
+    elif main_section == "Advanced Insights":
         render_advanced_insights(
             filtered=filtered,
             progress=filtered_progress,
@@ -141,7 +154,7 @@ def main() -> None:
             theme_mode=theme_mode,
         )
 
-    with tab_org:
+    else:
         render_organization_section(
             data=data,
             master=master,

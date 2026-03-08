@@ -9,7 +9,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from un_dashboard.design import ThemeMode, chart_palette_for, chart_scale_for, section_heading, style_plotly_figure
+from un_dashboard.design import ThemeMode, chart_palette_for, chart_scale_for, clickable_tabs, section_heading, style_plotly_figure
 from un_dashboard.questionnaires.base import QuestionnaireSchema
 from un_dashboard.services.form_profiles import resolve_profile
 from un_dashboard.services.transforms import find_column
@@ -60,7 +60,8 @@ def _value_counts(series: pd.Series, limit: int = 20) -> pd.DataFrame:
 
 
 def _multi_counts(series: pd.Series, limit: int = 25) -> pd.DataFrame:
-    non_empty = series.fillna("").astype(str).str.strip().replace("", pd.NA).dropna()
+    non_empty = series.dropna().map(str).map(lambda x: x.strip())
+    non_empty = non_empty[non_empty != ""]
     if non_empty.empty:
         return pd.DataFrame(columns=["value", "count"])
 
@@ -411,71 +412,13 @@ def render_adaptive_dashboard(
         return
 
     tab_labels = [str(t["label"]) for t in available_tabs] + ["Cross Analysis"]
-    ui_tabs = st.tabs(tab_labels)
+    selected_tab = clickable_tabs(
+        tab_labels,
+        key=f"adaptive_section_{_safe_id(project_name)}",
+        label="Questionnaire section",
+    )
 
-    for idx, tab in enumerate(available_tabs):
-        tab_key = _safe_id(f"{project_name}_{tab['key']}")
-        questions = tab["questions"]
-
-        with ui_tabs[idx]:
-            section_heading(str(tab["label"]), "Tab generated directly from XLSForm group structure.")
-
-            completion = _question_completion_df(org_data, questions)
-            avg_fill = float(completion["fill_rate"].mean()) if not completion.empty else float("nan")
-
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Rows", f"{len(org_data):,}")
-            m2.metric("Questions", f"{len(questions):,}")
-            m3.metric("Avg completion", "—" if pd.isna(avg_fill) else f"{avg_fill * 100:.1f}%")
-
-            if not completion.empty:
-                comp_top = completion.head(14).copy()
-                fig_comp = px.bar(
-                    comp_top,
-                    x="fill_rate",
-                    y="label",
-                    orientation="h",
-                    template=template,
-                    color="fill_rate",
-                    color_continuous_scale=chart_scale_for(theme_mode),
-                    title="Question Completion Rate",
-                )
-                fig_comp.update_layout(showlegend=False, xaxis_title="Completion rate", yaxis_title="Question")
-                fig_comp.update_xaxes(tickformat=".0%")
-                style_plotly_figure(fig_comp, theme_mode)
-                st.plotly_chart(fig_comp, use_container_width=True, key=f"{tab_key}_completion")
-
-            options = [str(q["name"]) for q in questions]
-            label_map = {str(q["name"]): str(q.get("label") or q["name"]) for q in questions}
-
-            c1, c2 = st.columns(2)
-            question_col = c1.selectbox(
-                "Question",
-                options,
-                format_func=lambda x: label_map.get(x, x),
-                key=f"{tab_key}_question",
-            )
-            breakdown_col = c2.selectbox(
-                "Breakdown (optional)",
-                ["None"] + [x for x in options if x != question_col],
-                key=f"{tab_key}_breakdown",
-            )
-
-            selected_question = next((q for q in questions if str(q.get("name", "")) == question_col), questions[0])
-            _render_single_question(
-                data=org_data,
-                question=selected_question,
-                breakdown_col=breakdown_col,
-                template=template,
-                theme_mode=theme_mode,
-                key=tab_key,
-            )
-
-            with st.expander("Section data preview", expanded=False):
-                preview_cols = options[: min(10, len(options))]
-                st.dataframe(_safe_preview(org_data, preview_cols, limit=300), use_container_width=True, hide_index=True)
-
-    with ui_tabs[-1]:
+    if selected_tab == "Cross Analysis":
         _render_cross_analysis(
             data=org_data,
             all_questions=all_questions,
@@ -483,4 +426,66 @@ def render_adaptive_dashboard(
             theme_mode=theme_mode,
             key=f"cross_{_safe_id(project_name)}",
         )
+        return
+
+    tab = next((item for item in available_tabs if str(item["label"]) == selected_tab), available_tabs[0])
+    tab_key = _safe_id(f"{project_name}_{tab['key']}")
+    questions = tab["questions"]
+
+    section_heading(str(tab["label"]), "Section generated directly from XLSForm group structure.")
+
+    completion = _question_completion_df(org_data, questions)
+    avg_fill = float(completion["fill_rate"].mean()) if not completion.empty else float("nan")
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Rows", f"{len(org_data):,}")
+    m2.metric("Questions", f"{len(questions):,}")
+    m3.metric("Avg completion", "—" if pd.isna(avg_fill) else f"{avg_fill * 100:.1f}%")
+
+    if not completion.empty:
+        comp_top = completion.head(14).copy()
+        fig_comp = px.bar(
+            comp_top,
+            x="fill_rate",
+            y="label",
+            orientation="h",
+            template=template,
+            color="fill_rate",
+            color_continuous_scale=chart_scale_for(theme_mode),
+            title="Question Completion Rate",
+        )
+        fig_comp.update_layout(showlegend=False, xaxis_title="Completion rate", yaxis_title="Question")
+        fig_comp.update_xaxes(tickformat=".0%")
+        style_plotly_figure(fig_comp, theme_mode)
+        st.plotly_chart(fig_comp, use_container_width=True, key=f"{tab_key}_completion")
+
+    options = [str(q["name"]) for q in questions]
+    label_map = {str(q["name"]): str(q.get("label") or q["name"]) for q in questions}
+
+    c1, c2 = st.columns(2)
+    question_col = c1.selectbox(
+        "Question",
+        options,
+        format_func=lambda x: label_map.get(x, x),
+        key=f"{tab_key}_question",
+    )
+    breakdown_col = c2.selectbox(
+        "Breakdown (optional)",
+        ["None"] + [x for x in options if x != question_col],
+        key=f"{tab_key}_breakdown",
+    )
+
+    selected_question = next((q for q in questions if str(q.get("name", "")) == question_col), questions[0])
+    _render_single_question(
+        data=org_data,
+        question=selected_question,
+        breakdown_col=breakdown_col,
+        template=template,
+        theme_mode=theme_mode,
+        key=tab_key,
+    )
+
+    with st.expander("Section data preview", expanded=False):
+        preview_cols = options[: min(10, len(options))]
+        st.dataframe(_safe_preview(org_data, preview_cols, limit=300), use_container_width=True, hide_index=True)
 

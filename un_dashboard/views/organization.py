@@ -15,9 +15,16 @@ from un_dashboard.core.constants import (
     ORG_SHEET_TABS,
     TARGET_INTERVIEWS_PER_ORG,
 )
-from un_dashboard.design import ThemeMode, section_heading, style_plotly_figure
+from un_dashboard.design import (
+    ThemeMode,
+    clickable_tabs,
+    render_glass_list,
+    render_glass_stats,
+    render_report_hero,
+    section_heading,
+    style_plotly_figure,
+)
 from un_dashboard.questionnaires import get_questionnaire_for_sheet_name
-from un_dashboard.questionnaires.gwo_beneficiaries import SCHEMA as GWO_BENEFICIARIES_SCHEMA
 from un_dashboard.services.sheets import (
     append_worksheet_rows,
     get_worksheet_header,
@@ -26,12 +33,16 @@ from un_dashboard.services.sheets import (
     parse_sheet_id,
     update_worksheet_header,
 )
+from un_dashboard.services.reporting import build_report_artifacts
 from un_dashboard.services.transforms import (
+    build_daily_interviews,
+    find_column,
     format_percent,
     infer_org_code_from_sheet,
     sanitize_for_display,
 )
 from un_dashboard.views.adaptive_dashboard import render_adaptive_dashboard
+from un_dashboard.views.dashboard_router import render_dashboard_by_questionnaire
 from un_dashboard.views.gwo_dashboard import render_gwo_dashboard
 
 COUNT_OPTION = "Count (Rows)"
@@ -156,6 +167,70 @@ def _project_choices(data: pd.DataFrame) -> list[str]:
     available = {str(x).strip() for x in data["sheet_name"].dropna().astype(str).tolist() if str(x).strip()}
     extras = sorted([name for name in available if name not in set(base)], key=str.lower)
     return base + extras
+
+
+def _preferred_start_column(org_data: pd.DataFrame, indicators: dict[str, str | None]) -> str | None:
+    start_col = find_column(org_data, ["start"])
+    if start_col and start_col in org_data.columns:
+        return start_col
+
+    date_col = indicators.get("date")
+    if date_col and date_col in org_data.columns:
+        return date_col
+
+    fallback = find_column(org_data, ["date_time", "submissiondate", "interview_date", "today"])
+    if fallback and fallback in org_data.columns:
+        return fallback
+    return None
+
+
+def _render_start_timeline_panel(
+    org_data: pd.DataFrame,
+    indicators: dict[str, str | None],
+    template: str,
+    theme_mode: ThemeMode,
+) -> None:
+    section_heading("Start-Date Timeline", "Daily interview count and cumulative progress from the interview start field.")
+
+    date_col = _preferred_start_column(org_data, indicators)
+    if not date_col:
+        st.info("No start/date column was detected for timeline rendering.")
+        return
+
+    trend = build_daily_interviews(org_data, date_col)
+    if trend.empty:
+        st.info(f"Column `{date_col}` is present, but no valid dates were found for timeline rendering.")
+        return
+
+    peak_row = trend.sort_values("interviews", ascending=False).iloc[0]
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Active days", f"{len(trend):,}")
+    c2.metric("Peak daily interviews", f"{int(peak_row['interviews']):,}")
+    c3.metric("Latest cumulative", f"{int(trend['cumulative'].iloc[-1]):,}")
+
+    fig = px.bar(
+        trend,
+        x="date",
+        y="interviews",
+        color="interviews",
+        template=template,
+        title=f"Daily Interviews by `{date_col}`",
+    )
+    fig.add_scatter(
+        x=trend["date"],
+        y=trend["cumulative"],
+        mode="lines+markers",
+        name="Cumulative",
+        yaxis="y2",
+    )
+    fig.update_layout(
+        yaxis_title="Daily interviews",
+        xaxis_title="Date",
+        yaxis2=dict(title="Cumulative", overlaying="y", side="right"),
+        legend=dict(orientation="h"),
+    )
+    style_plotly_figure(fig, theme_mode)
+    st.plotly_chart(fig, use_container_width=True)
 
 
 def _canonical_first_tabs(source_tabs: list[str]) -> list[str]:
@@ -783,7 +858,7 @@ def _render_custom_chart_tab(
             return
 
         style_plotly_figure(fig, theme_mode)
-        fig.update_layout(transition_duration=120)
+        fig.update_layout(transition_duration=0)
         st.plotly_chart(
             fig,
             use_container_width=True,
@@ -824,11 +899,13 @@ def render_organization_section(
 
     org_progress_row = progress[progress["org_code"] == selected_org_code].head(1)
 
-    org_dash, org_report, org_updater, org_pivot, org_builder = st.tabs(
-        ["Dashboard", "Report", "Updater", "Pivot Tables", "Chart Builder"]
+    active_section = clickable_tabs(
+        ["Dashboard", "Report", "Updater", "Pivot Tables", "Chart Builder"],
+        key=f"org_module_tabs_{selected_org_code}",
+        label="Organization module",
     )
 
-    with org_dash:
+    if active_section == "Dashboard":
         project_questionnaire = get_questionnaire_for_sheet_name(selected_project)
         province = (
             str(org_data["province"].dropna().astype(str).mode().iloc[0])
@@ -852,19 +929,36 @@ def render_organization_section(
             col4.metric("Interviews", f"{interviews}/{TARGET_INTERVIEWS_PER_ORG}")
             st.progress(min(max(progress_pct, 0.0), 1.0))
 
+        _render_start_timeline_panel(
+            org_data=org_data,
+            indicators=indicators,
+            template=template,
+            theme_mode=theme_mode,
+        )
+
         if project_questionnaire and project_questionnaire.key == "gwo_beneficiaries":
-            render_gwo_dashboard(org_data, GWO_BENEFICIARIES_SCHEMA.org_dashboard_tabs, template, theme_mode)
+            gwo_tabs = project_questionnaire.org_dashboard_tabs if project_questionnaire.org_dashboard_tabs else {}
+            render_gwo_dashboard(org_data, gwo_tabs, template, theme_mode)
         else:
-            render_adaptive_dashboard(
+            rendered = render_dashboard_by_questionnaire(
                 org_data=org_data,
+                questionnaire=project_questionnaire,
                 project_name=selected_project,
                 forms_dir=forms_dir,
                 template=template,
                 theme_mode=theme_mode,
-                questionnaire=project_questionnaire,
             )
+            if not rendered:
+                render_adaptive_dashboard(
+                    org_data=org_data,
+                    project_name=selected_project,
+                    forms_dir=forms_dir,
+                    template=template,
+                    theme_mode=theme_mode,
+                    questionnaire=project_questionnaire,
+                )
 
-    with org_report:
+    elif active_section == "Report":
         province = (
             str(org_data["province"].dropna().astype(str).mode().iloc[0])
             if "province" in org_data.columns and not org_data["province"].dropna().empty
@@ -879,29 +973,125 @@ def render_organization_section(
         progress_pct = (interviews / TARGET_INTERVIEWS_PER_ORG) if TARGET_INTERVIEWS_PER_ORG else 0.0
 
         with st.container():
-            section_heading("Organization Report", "Export-ready summary for this organization only.")
-            st.write(f"- Organization: **{selected_project}**")
-            st.write(f"- Organization Code: **{selected_org_code}**")
-            st.write(f"- Province: **{province}**")
-            st.write(f"- INGO Partner: **{partner}**")
-            st.write(f"- Interviews: **{interviews}/{TARGET_INTERVIEWS_PER_ORG}**")
-            st.write(f"- Completion: **{format_percent(progress_pct)}**")
+            section_heading("Organization Report Center", "Full PDF, Word, and Excel report for the selected organization with narrative insights and charts.")
+            if org_data.empty:
+                st.info("No data found for this organization.")
+            else:
+                report_scope = f"{selected_project} ({selected_org_code})"
+                artifacts = build_report_artifacts(
+                    scope_kind="organization",
+                    scope_label=report_scope,
+                    data=org_data,
+                    progress=org_progress_row,
+                    indicators=indicators,
+                    theme_mode=theme_mode,
+                )
 
-            safe_preview = sanitize_for_display(org_data).head(300)
-            st.dataframe(safe_preview, use_container_width=True, hide_index=True)
+                metric_map = {row["Metric"]: row["Value"] for _, row in artifacts["summary_table"].iterrows()}
+                render_report_hero(
+                    title=f"{selected_project} Advanced Report",
+                    subtitle="Premium organization report with KPI intelligence, narrative analysis, and a modern start-date interview timeline.",
+                    badges=[selected_org_code, province, partner, "PDF", "Word", "Excel"],
+                )
+                render_glass_stats(
+                    [
+                        {"label": "Interviews", "value": metric_map.get("Interviews analyzed", "0"), "note": "Records in this organization"},
+                        {"label": "Completion", "value": metric_map.get("Completion", "N/A"), "note": "Against organization target"},
+                        {"label": "Projects", "value": metric_map.get("Projects covered", "0"), "note": "Sheet scope represented"},
+                        {"label": "Completeness", "value": metric_map.get("Data completeness", "N/A"), "note": "Key-indicator coverage"},
+                    ]
+                )
 
-            st.download_button(
-                f"Download {selected_project} CSV",
-                data=safe_preview.to_csv(index=False).encode("utf-8"),
-                file_name=f"{selected_project}_report.csv",
-                mime="text/csv",
-            )
+                info_col, risk_col, rec_col = st.columns(3)
+                with info_col:
+                    render_glass_list("Executive Summary", artifacts["insights"])
+                with risk_col:
+                    render_glass_list("Key Risks", artifacts["risks"])
+                with rec_col:
+                    render_glass_list("Recommendations", artifacts["recommendations"])
 
-    with org_updater:
+                st.write(f"- Organization: **{selected_project}**")
+                st.write(f"- Organization Code: **{selected_org_code}**")
+                st.write(f"- Province: **{province}**")
+                st.write(f"- INGO Partner: **{partner}**")
+                st.write(f"- Interviews: **{interviews}/{TARGET_INTERVIEWS_PER_ORG}**")
+                st.write(f"- Completion: **{format_percent(progress_pct)}**")
+
+                metric_map = {row["Metric"]: row["Value"] for _, row in artifacts["summary_table"].iterrows()}
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Interviews", metric_map.get("Interviews analyzed", "0"))
+                m2.metric("Completion", metric_map.get("Completion", "—"))
+                m3.metric("Projects", metric_map.get("Projects covered", "0"))
+                m4.metric("Data completeness", metric_map.get("Data completeness", "—"))
+
+                st.markdown("##### Executive Summary")
+                for item in artifacts["insights"]:
+                    st.write(f"- {item}")
+
+                st.markdown("##### Key Risks")
+                for item in artifacts["risks"]:
+                    st.write(f"- {item}")
+
+                st.markdown("##### Recommendations")
+                for item in artifacts["recommendations"]:
+                    st.write(f"- {item}")
+
+                st.dataframe(artifacts["indicator_table"], use_container_width=True, hide_index=True)
+
+                section_heading("Core Analytical Visuals", "High-value visuals included in the downloadable organization report.")
+                for chart in artifacts["charts"]:
+                    st.markdown(f"##### {chart['title']}")
+                    st.caption(chart["caption"])
+                    st.image(chart["image"], use_container_width=True)
+                    st.dataframe(chart["table"].head(20), use_container_width=True, hide_index=True)
+
+                org_activity_sections = artifacts.get("org_activity_sections", [])
+                if org_activity_sections:
+                    section_heading(
+                        "Start-Date Interview Timeline",
+                        "Exact daily interview count for this organization based on the `start` field, including weekday pattern.",
+                    )
+                    activity_section = org_activity_sections[0]
+                    st.markdown(f"##### {activity_section['title']}")
+                    st.caption(activity_section["caption"])
+                    st.image(activity_section["image"], use_container_width=True)
+                    st.dataframe(activity_section["table"].head(31), use_container_width=True, hide_index=True)
+
+                safe_preview = sanitize_for_display(org_data).head(300)
+                st.markdown("##### Dataset Preview")
+                st.dataframe(safe_preview, use_container_width=True, hide_index=True)
+
+                download_cols = st.columns(4)
+                download_cols[0].download_button(
+                    "Download PDF",
+                    data=artifacts["pdf_bytes"],
+                    file_name=f"{artifacts['file_stub']}.pdf",
+                    mime="application/pdf",
+                )
+                download_cols[1].download_button(
+                    "Download Word",
+                    data=artifacts["word_bytes"],
+                    file_name=f"{artifacts['file_stub']}.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                )
+                download_cols[2].download_button(
+                    "Download Excel",
+                    data=artifacts["excel_bytes"],
+                    file_name=f"{artifacts['file_stub']}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+                download_cols[3].download_button(
+                    "Download CSV Preview",
+                    data=safe_preview.to_csv(index=False).encode("utf-8"),
+                    file_name=f"{selected_project}_report.csv",
+                    mime="text/csv",
+                )
+
+    elif active_section == "Updater":
         _render_dataset_updater_tab(data, selected_project, sheet_url, service_info)
 
-    with org_pivot:
+    elif active_section == "Pivot Tables":
         _render_pivot_tables_tab(org_data, selected_project)
 
-    with org_builder:
+    else:
         _render_custom_chart_tab(org_data, selected_project, template, theme_mode)

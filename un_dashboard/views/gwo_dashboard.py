@@ -18,6 +18,7 @@ from un_dashboard.design import (
     ThemeMode,
     chart_palette_for,
     chart_scale_for,
+    clickable_tabs,
     section_heading,
     style_plotly_figure,
 )
@@ -26,6 +27,18 @@ from un_dashboard.services.transforms import find_column, normalize_token
 
 def _resolve_columns(df: pd.DataFrame, candidates_map: Mapping[str, Sequence[str]]) -> dict[str, Optional[str]]:
     return {key: find_column(df, candidates) for key, candidates in candidates_map.items()}
+
+
+def _as_series(value: pd.Series | pd.DataFrame | None) -> pd.Series:
+    if value is None:
+        return pd.Series(dtype="object")
+    if isinstance(value, pd.DataFrame):
+        if value.shape[1] == 0:
+            return pd.Series(dtype="object")
+        return value.iloc[:, 0]
+    if isinstance(value, pd.Series):
+        return value
+    return pd.Series(value)
 
 
 def _parse_numeric_cell(value) -> float:
@@ -48,11 +61,12 @@ def _parse_numeric_cell(value) -> float:
 
 
 def _numeric_series(series: pd.Series) -> pd.Series:
-    return series.map(_parse_numeric_cell)
+    return _as_series(series).map(_parse_numeric_cell)
 
 
 def _safe_counts(series: pd.Series, top_n: Optional[int] = None) -> pd.DataFrame:
-    counts = series.fillna("Unknown").astype(str).value_counts().reset_index()
+    base = _as_series(series)
+    counts = base.fillna("Unknown").astype(str).value_counts().reset_index()
     counts.columns = ["value", "count"]
     if top_n is not None:
         counts = counts.head(top_n)
@@ -60,20 +74,16 @@ def _safe_counts(series: pd.Series, top_n: Optional[int] = None) -> pd.DataFrame
 
 
 def _multiselect_counts(series: pd.Series, top_n: int = 12) -> pd.DataFrame:
-    if series is None:
+    base = _as_series(series)
+    if base.empty:
         return pd.DataFrame(columns=["value", "count"])
 
-    token_series = (
-        series.dropna()
-        .astype(str)
-        .str.strip()
-        .replace("", np.nan)
-        .dropna()
-        .str.split(r"\s+")
-    )
-    if token_series.empty:
+    cleaned = base.dropna().map(str).map(lambda x: x.strip())
+    cleaned = cleaned[cleaned != ""]
+    if cleaned.empty:
         return pd.DataFrame(columns=["value", "count"])
 
+    token_series = cleaned.str.split(r"\s+")
     exploded = token_series.explode().dropna().astype(str).str.strip()
     if exploded.empty:
         return pd.DataFrame(columns=["value", "count"])
@@ -85,22 +95,24 @@ def _multiselect_counts(series: pd.Series, top_n: int = 12) -> pd.DataFrame:
 
 
 def _yes_mask(series: pd.Series) -> pd.Series:
-    return series.fillna("").map(normalize_token).isin(YES_VALUES)
+    return _as_series(series).fillna("").map(normalize_token).isin(YES_VALUES)
 
 
 def _yes_rate(series: pd.Series) -> float:
-    if series is None or series.empty:
+    base = _as_series(series)
+    if base.empty:
         return float("nan")
-    valid = series.dropna()
+    valid = base.dropna()
     if valid.empty:
         return float("nan")
     return float(_yes_mask(valid).mean())
 
 
 def _non_empty_rate(series: pd.Series) -> float:
-    if series is None or series.empty:
+    base = _as_series(series)
+    if base.empty:
         return float("nan")
-    filled = series.fillna("").astype(str).str.strip()
+    filled = base.fillna("").astype(str).str.strip()
     return float((filled != "").mean())
 
 
@@ -146,8 +158,8 @@ def _render_sample_tab(org_data: pd.DataFrame, sample_cols: dict[str, Optional[s
         section_heading("Sample Information", "Enumerator and location profile in a clean overview.")
         c1, c2, c3 = st.columns(3)
         c1.metric("Interviews", f"{len(org_data):,}")
-        c2.metric("Surveyors", f"{org_data[surveyor_col].nunique() if surveyor_col else 0:,}")
-        c3.metric("Districts", f"{org_data[district_col].nunique() if district_col else 0:,}")
+        c2.metric("Surveyors", f"{_as_series(org_data[surveyor_col]).nunique() if surveyor_col else 0:,}")
+        c3.metric("Districts", f"{_as_series(org_data[district_col]).nunique() if district_col else 0:,}")
 
     with st.container():
         section_heading("Field Distribution", "Top district volume by province")
@@ -274,7 +286,7 @@ def _render_respondent_tab(org_data: pd.DataFrame, cols: dict[str, Optional[str]
                     {
                         "household_members": _numeric_series(org_data[hh_col]),
                         "avg_income": _numeric_series(org_data[income_col]),
-                        "employment": org_data[emp_col].fillna("Unknown").astype(str) if emp_col else "Unknown",
+                        "employment": _as_series(org_data[emp_col]).fillna("Unknown").astype(str) if emp_col else "Unknown",
                     }
                 ).dropna(subset=["household_members", "avg_income"])
                 if not scatter_df.empty:
@@ -318,9 +330,9 @@ def _render_training_tab(org_data: pd.DataFrame, cols: dict[str, Optional[str]],
         return
 
     train_df = pd.DataFrame(index=org_data.index)
-    train_df["attended"] = org_data[attend_col].fillna("Unknown").astype(str) if attend_col else "Unknown"
-    train_df["sessions_cat"] = org_data[sessions_col].fillna("Unknown").astype(str) if sessions_col else "Unknown"
-    train_df["duration_cat"] = org_data[duration_col].fillna("Unknown").astype(str) if duration_col else "Unknown"
+    train_df["attended"] = _as_series(org_data[attend_col]).fillna("Unknown").astype(str) if attend_col else "Unknown"
+    train_df["sessions_cat"] = _as_series(org_data[sessions_col]).fillna("Unknown").astype(str) if sessions_col else "Unknown"
+    train_df["duration_cat"] = _as_series(org_data[duration_col]).fillna("Unknown").astype(str) if duration_col else "Unknown"
     train_df["sessions_num"] = _numeric_series(org_data[sessions_col]) if sessions_col else np.nan
     train_df["duration_num"] = _numeric_series(org_data[duration_col]) if duration_col else np.nan
 
@@ -589,7 +601,7 @@ def _render_market_changes_tab(org_data: pd.DataFrame, cols: dict[str, Optional[
         ]:
             if col:
                 yes_count = int(_yes_mask(org_data[col]).sum())
-                total = int(org_data[col].notna().sum())
+                total = int(_as_series(org_data[col]).notna().sum())
                 no_count = max(total - yes_count, 0)
                 chart_data.append({"metric": label, "response": "Yes", "count": yes_count})
                 chart_data.append({"metric": label, "response": "No/Other", "count": no_count})
@@ -715,10 +727,11 @@ def _render_safeguarding_tab(org_data: pd.DataFrame, cols: dict[str, Optional[st
     with st.container():
         section_heading("Concerns Notes", "Open-ended concern reporting and data preview")
         if concerns_col:
-            non_empty = int(org_data[concerns_col].fillna("").astype(str).str.strip().ne("").sum())
+            concerns_series = _as_series(org_data[concerns_col])
+            non_empty = int(concerns_series.fillna("").astype(str).str.strip().ne("").sum())
             rate = non_empty / len(org_data) if len(org_data) else float("nan")
             st.metric("Rows with concern text", f"{non_empty:,} ({_format_pct(rate)})")
-            preview = org_data[[concerns_col]].copy()
+            preview = pd.DataFrame({"concerns_note": concerns_series})
             preview.columns = ["concerns_note"]
             st.dataframe(preview.head(200), use_container_width=True, hide_index=True)
         else:
@@ -743,15 +756,7 @@ def render_gwo_dashboard(
     market_cols = _resolve_columns(org_data, tab_config.get("market_perceived_changes", {}))
     safeguarding_cols = _resolve_columns(org_data, tab_config.get("household_safeguarding", {}))
 
-    (
-        tab_sample,
-        tab_resp,
-        tab_train,
-        tab_kits,
-        tab_skills,
-        tab_market,
-        tab_safe,
-    ) = st.tabs(
+    section = clickable_tabs(
         [
             "Sample Information",
             "Respondent details",
@@ -760,26 +765,28 @@ def render_gwo_dashboard(
             "Use of skills and inputs",
             "Market and perceived changes",
             "Household and safeguarding",
-        ]
+        ],
+        key="gwo_dashboard_section",
+        label="GWO dashboard section",
     )
 
-    with tab_sample:
+    if section == "Sample Information":
         _render_sample_tab(org_data, sample_cols, template, theme_mode)
 
-    with tab_resp:
+    elif section == "Respondent details":
         _render_respondent_tab(org_data, respondent_cols, template, theme_mode)
 
-    with tab_train:
+    elif section == "Participation in training":
         _render_training_tab(org_data, training_cols, template, theme_mode)
 
-    with tab_kits:
+    elif section == "Receipt of production kits":
         _render_kits_tab(org_data, kits_cols, template, theme_mode)
 
-    with tab_skills:
+    elif section == "Use of skills and inputs":
         _render_use_skills_tab(org_data, skills_cols, template, theme_mode)
 
-    with tab_market:
+    elif section == "Market and perceived changes":
         _render_market_changes_tab(org_data, market_cols, template, theme_mode)
 
-    with tab_safe:
+    else:
         _render_safeguarding_tab(org_data, safeguarding_cols, template, theme_mode)
