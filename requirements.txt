@@ -10,3 +10,4 @@ requests>=2.32
 openai>=1.58
 gspread>=6.1
 google-auth>=2.37
+plotly_get_chrome
